@@ -14001,11 +14001,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     f"for the session, `/approve always` to approve permanently, or `/deny` to cancel."
                 )
                 try:
+                    # Mark as approval prompt so WeCom routes through control lane
+                    _approval_metadata = dict(_status_thread_metadata or {})
+                    _approval_metadata["is_approval_prompt"] = True
+
                     _approval_send_fut = safe_schedule_threadsafe(
                         _status_adapter.send(
                             _status_chat_id,
                             msg,
-                            metadata=_status_thread_metadata,
+                            metadata=_approval_metadata,
                         ),
                         _loop_for_step,
                         logger=logger,
