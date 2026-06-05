@@ -12070,6 +12070,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         text itself is already delivered — this only handles file attachments
         that the normal _process_message_background path would have caught.
         """
+        logger.info("[DEBUG] _deliver_media_from_response called: response=%r chat=%s", response[:100], event.source.chat_id)
         from pathlib import Path
         from urllib.parse import quote as _quote
 
