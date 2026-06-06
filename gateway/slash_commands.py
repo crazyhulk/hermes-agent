@@ -3946,7 +3946,23 @@ class GatewaySlashCommandsMixin:
 
         logger.info("User approved %d dangerous command(s) via /approve (%s)", count, choice)
         plural = "plural" if count > 1 else "singular"
-        return t(f"gateway.approve.{choice}_{plural}", count=count)
+        confirmation_text = t(f"gateway.approve.{choice}_{plural}", count=count)
+        if _adapter:
+            try:
+                await _adapter.send(
+                    source.chat_id,
+                    confirmation_text,
+                    metadata={"is_approval_prompt": True},
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to send /approve confirmation to %s: %s",
+                    source.chat_id,
+                    exc,
+                    exc_info=True,
+                )
+
+        return None
 
     async def _handle_deny_command(self, event: MessageEvent) -> str:
         """Handle /deny command — reject pending dangerous command(s).
@@ -3982,9 +3998,27 @@ class GatewaySlashCommandsMixin:
             _adapter.resume_typing_for_chat(source.chat_id)
 
         logger.info("User denied %d dangerous command(s) via /deny", count)
-        if count > 1:
-            return t("gateway.deny.denied_plural", count=count)
-        return t("gateway.deny.denied_singular")
+        confirmation_text = (
+            t("gateway.deny.denied_plural", count=count)
+            if count > 1
+            else t("gateway.deny.denied_singular")
+        )
+        if _adapter:
+            try:
+                await _adapter.send(
+                    source.chat_id,
+                    confirmation_text,
+                    metadata={"is_approval_prompt": True},
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to send /deny confirmation to %s: %s",
+                    source.chat_id,
+                    exc,
+                    exc_info=True,
+                )
+
+        return None
 
     async def _handle_debug_command(self, event: MessageEvent) -> str:
         """Handle /debug — upload debug report (summary only) and return paste URLs.
