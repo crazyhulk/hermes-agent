@@ -324,6 +324,9 @@ _COMMON_BETAS = [
 _TOOL_STREAMING_BETA = "fine-grained-tool-streaming-2025-05-14"
 # 1M context beta. Native Anthropic does not get this by default because some
 # subscriptions reject it, but Bedrock/Azure still need it for 1M context.
+# Self-hosted / corporate Anthropic-Messages gateways (e.g. company LLM
+# proxies that front Claude with their own auth scheme) typically gate 1M
+# behind this same header — opt them in via ``HERMES_ANTHROPIC_CONTEXT_1M=1``.
 _CONTEXT_1M_BETA = "context-1m-2025-08-07"
 
 # Fast mode beta — enables the ``speed: "fast"`` request parameter for
@@ -546,8 +549,33 @@ def _requires_bearer_auth(base_url: str | None) -> bool:
     )
 
 
+def _force_context_1m_beta_via_env() -> bool:
+    """Return True when ``HERMES_ANTHROPIC_CONTEXT_1M`` opts the request in.
+
+    Self-hosted / corporate Anthropic-Messages gateways (e.g. internal
+    LLM proxies that front Claude with a custom auth scheme) typically
+    expose 1M context behind the same ``anthropic-beta:
+    context-1m-2025-08-07`` header that Anthropic's own API uses, but
+    Hermes only auto-attaches the beta on hosts the adapter recognises
+    (Azure Foundry, Bedrock). This env switch lets users opt those
+    gateways in without per-host wiring. Truthy values: ``1``, ``true``,
+    ``yes``, ``on`` (case-insensitive).
+    """
+    raw = os.environ.get("HERMES_ANTHROPIC_CONTEXT_1M", "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 def _base_url_needs_context_1m_beta(base_url: str | None) -> bool:
-    """Return True for endpoints that still gate 1M context behind a beta."""
+    """Return True for endpoints that still gate 1M context behind a beta.
+
+    Honours the ``HERMES_ANTHROPIC_CONTEXT_1M`` env switch so that
+    self-hosted / corporate Anthropic-Messages gateways can opt their
+    requests in without per-host wiring. The drop_context_1m_beta path
+    in ``_common_betas_for_base_url`` still wins, so reactive recovery
+    after a 400 keeps working.
+    """
+    if _force_context_1m_beta_via_env():
+        return True
     normalized = _normalize_base_url_text(base_url).lower()
     if not normalized:
         return False
@@ -1369,15 +1397,7 @@ def run_oauth_setup_token() -> Optional[str]:
 # Stores credentials in ~/.hermes/.anthropic_oauth.json (our own file).
 
 _OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-# Anthropic migrated the OAuth token endpoint to platform.claude.com;
-# console.anthropic.com now 404s. Callers should iterate _OAUTH_TOKEN_URLS
-# (new host first, console fallback). _OAUTH_TOKEN_URL is kept as the primary
-# for backward compatibility with existing imports and now points at the live host.
-_OAUTH_TOKEN_URLS = [
-    "https://platform.claude.com/v1/oauth/token",
-    "https://console.anthropic.com/v1/oauth/token",
-]
-_OAUTH_TOKEN_URL = _OAUTH_TOKEN_URLS[0]
+_OAUTH_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
 _OAUTH_REDIRECT_URI = "https://console.anthropic.com/oauth/code/callback"
 _OAUTH_SCOPES = "org:create_api_key user:profile user:inference"
 _HERMES_OAUTH_FILE = get_hermes_home() / ".anthropic_oauth.json"
@@ -1475,34 +1495,18 @@ def run_hermes_oauth_login_pure() -> Optional[Dict[str, Any]]:
             "code_verifier": verifier,
         }).encode()
 
-        # Anthropic migrated the OAuth token endpoint to platform.claude.com;
-        # console.anthropic.com now 404s. Try the new host first, then fall
-        # back to console for older deployments (mirrors the refresh path).
-        result = None
-        last_error = None
-        for endpoint in _OAUTH_TOKEN_URLS:
-            req = urllib.request.Request(
-                endpoint,
-                data=exchange_data,
-                headers={
-                    "Content-Type": "application/json",
-                    "User-Agent": f"claude-cli/{_get_claude_code_version()} (external, cli)",
-                },
-                method="POST",
-            )
-            try:
-                with urllib.request.urlopen(req, timeout=15) as resp:
-                    result = json.loads(resp.read().decode())
-                break
-            except Exception as exc:
-                last_error = exc
-                logger.debug("Anthropic token exchange failed at %s: %s", endpoint, exc)
-                continue
+        req = urllib.request.Request(
+            _OAUTH_TOKEN_URL,
+            data=exchange_data,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": f"claude-cli/{_get_claude_code_version()} (external, cli)",
+            },
+            method="POST",
+        )
 
-        if result is None:
-            raise last_error if last_error is not None else ValueError(
-                "Anthropic token exchange failed"
-            )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            result = json.loads(resp.read().decode())
     except Exception as e:
         print(f"Token exchange failed: {e}")
         return None

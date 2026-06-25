@@ -203,6 +203,19 @@ DEFAULT_CONTEXT_LENGTHS = {
     "claude-sonnet-4-6": 1000000,
     "claude-opus-4.6": 1000000,
     "claude-sonnet-4.6": 1000000,
+    # Reverse-ordered slugs used by self-hosted / corporate gateways that
+    # name models as "claude-<version>-<family>" instead of the official
+    # "claude-<family>-<version>" (e.g. bilibili's llmapi gateway exposes
+    # ``claude-4.6-sonnet`` / ``claude-4.6-opus`` / ``claude-4.7-opus``).
+    # Listed both in dot and dash form because callers may bypass
+    # normalize_model_name (Hermes' own context lookup runs on the raw
+    # config slug before the Anthropic adapter normalises dots).
+    "claude-4-7-opus": 1000000,
+    "claude-4.7-opus": 1000000,
+    "claude-4-6-opus": 1000000,
+    "claude-4.6-opus": 1000000,
+    "claude-4-6-sonnet": 1000000,
+    "claude-4.6-sonnet": 1000000,
     # Catch-all for older Claude models (must sort after specific entries)
     "claude": 200000,
     # OpenAI — GPT-5 family (most have 400k; specific overrides first)

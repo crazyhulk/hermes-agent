@@ -223,6 +223,85 @@ class TestBuildAnthropicClient:
             kwargs = mock_sdk.AnthropicBedrock.call_args[1]
             assert kwargs["max_retries"] == 0
 
+    def test_env_switch_forces_context_1m_beta_on_third_party_endpoint(self, monkeypatch):
+        """HERMES_ANTHROPIC_CONTEXT_1M=1 attaches context-1m to a corporate gateway.
+
+        Self-hosted / corporate Anthropic-Messages gateways (e.g. bilibili's
+        ``llmapi.bilibili.co``) speak the Anthropic protocol but are not on
+        the adapter's host allow-list, so by default they don't get the 1M
+        beta and Claude rejects >200K-token payloads with HTTP 400 "Input is
+        too long". The env switch lets users opt those gateways in without
+        per-host wiring.
+        """
+        monkeypatch.setenv("HERMES_ANTHROPIC_CONTEXT_1M", "1")
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            build_anthropic_client(
+                "bsk-corp-secret",
+                base_url="https://llmapi.example.co",
+            )
+            kwargs = mock_sdk.Anthropic.call_args[1]
+            betas = kwargs["default_headers"]["anthropic-beta"]
+            assert "context-1m-2025-08-07" in betas
+
+    def test_env_switch_off_keeps_third_party_default(self, monkeypatch):
+        """Without HERMES_ANTHROPIC_CONTEXT_1M, third-party endpoints stay un-opted.
+
+        Guards against accidentally inheriting the env var from a user's
+        shell during test runs — the default behaviour must keep the 1M
+        beta off for non-Azure/non-Bedrock hosts so accounts that reject
+        the beta still get short auxiliary calls through.
+        """
+        monkeypatch.delenv("HERMES_ANTHROPIC_CONTEXT_1M", raising=False)
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            build_anthropic_client(
+                "sk-ant-api03-x",
+                base_url="https://llmapi.example.co",
+            )
+            kwargs = mock_sdk.Anthropic.call_args[1]
+            betas = kwargs["default_headers"]["anthropic-beta"]
+            assert "context-1m-2025-08-07" not in betas
+
+    def test_env_switch_drop_context_1m_beta_still_wins(self, monkeypatch):
+        """drop_context_1m_beta=True trumps the env switch.
+
+        The reactive recovery path in run_agent.py sets ``drop_context_1m_beta``
+        after a 400 from the upstream rejecting the beta. The env switch is a
+        client-default opt-in; the per-call drop must keep the ability to
+        recover even when the user has set the env var.
+        """
+        monkeypatch.setenv("HERMES_ANTHROPIC_CONTEXT_1M", "1")
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            build_anthropic_client(
+                "bsk-corp-secret",
+                base_url="https://llmapi.example.co",
+                drop_context_1m_beta=True,
+            )
+            kwargs = mock_sdk.Anthropic.call_args[1]
+            betas = kwargs["default_headers"]["anthropic-beta"]
+            assert "context-1m-2025-08-07" not in betas
+
+    @pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "On"])
+    def test_env_switch_accepts_truthy_values(self, monkeypatch, value):
+        monkeypatch.setenv("HERMES_ANTHROPIC_CONTEXT_1M", value)
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            build_anthropic_client(
+                "sk-ant-api03-x",
+                base_url="https://llmapi.example.co",
+            )
+            betas = mock_sdk.Anthropic.call_args[1]["default_headers"]["anthropic-beta"]
+            assert "context-1m-2025-08-07" in betas
+
+    @pytest.mark.parametrize("value", ["", "0", "false", "no", "off", "garbage"])
+    def test_env_switch_rejects_non_truthy_values(self, monkeypatch, value):
+        monkeypatch.setenv("HERMES_ANTHROPIC_CONTEXT_1M", value)
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            build_anthropic_client(
+                "sk-ant-api03-x",
+                base_url="https://llmapi.example.co",
+            )
+            betas = mock_sdk.Anthropic.call_args[1]["default_headers"]["anthropic-beta"]
+            assert "context-1m-2025-08-07" not in betas
+
 
 class TestReadClaudeCodeCredentials:
     @pytest.fixture(autouse=True)
