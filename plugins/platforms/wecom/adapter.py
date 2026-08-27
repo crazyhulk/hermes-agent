@@ -935,9 +935,11 @@ class WeComAdapter(BasePlatformAdapter):
         # Unrouted payload — did not match reply-queue, pending-response,
         # callback, ping, or event. If WeCom delivers group messages under a
         # cmd not in CALLBACK_COMMANDS, they land here and are dropped. Log at
-        # INFO with cmd + body keys so we can spot an unhandled callback cmd.
+        # DEBUG for routine pings, INFO for unexpected commands we might need to handle.
         body_keys = list(payload.get("body", {}).keys()) if isinstance(payload.get("body"), dict) else None
-        logger.info(
+        _log_level = logging.DEBUG if not cmd or cmd == "(empty)" else logging.INFO
+        logger.log(
+            _log_level,
             "[%s] Unrouted websocket payload dropped: cmd=%r req_id=%s body_keys=%s",
             self.name, cmd or "(empty)", req_id or "(none)", body_keys,
         )
@@ -1264,6 +1266,21 @@ class WeComAdapter(BasePlatformAdapter):
         body = payload.get("body")
         if not isinstance(body, dict):
             return
+
+        # --- Full callback dump: log the complete body + source frame metadata
+        # so we can diagnose routing issues (e.g. group @mentions arriving as
+        # chattype='single' with no chatid).
+        try:
+            _dump_body = json.dumps(body, ensure_ascii=False, default=str)
+        except Exception:
+            _dump_body = repr(body)
+        logger.info(
+            "[%s] Inbound callback FULL payload: cmd=%r req_id=%s body=%s",
+            self.name,
+            payload.get("cmd"),
+            self._payload_req_id(payload),
+            _dump_body[:2000],
+        )
 
         msg_id = str(body.get("msgid") or self._payload_req_id(payload) or uuid.uuid4().hex)
         if self._dedup.is_duplicate(msg_id):
@@ -1869,6 +1886,7 @@ class WeComAdapter(BasePlatformAdapter):
         entirely when keep-alive is disabled by config (the default).
         """
         if not self._stream_keepalive_enabled:
+            logger.debug("[%s] keepalive: DISABLED by config", self.name)
             return
         if turn.finalized or turn.expired:
             return
@@ -1878,6 +1896,10 @@ class WeComAdapter(BasePlatformAdapter):
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return  # not inside a loop (defensive)
+        logger.info(
+            "[%s] keepalive: ARMED (interval=%.0fs, turn=%s)",
+            self.name, self._stream_keepalive_interval_seconds, turn.stream_id,
+        )
         handle = loop.call_later(
             self._stream_keepalive_interval_seconds,
             self._on_keepalive_fire,
