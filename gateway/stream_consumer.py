@@ -459,6 +459,7 @@ class GatewayStreamConsumer:
         self._tool_start_times: dict[str, float] = {}  # tool_name -> monotonic start
         self._tool_timer_labels: dict[str, str] = {}  # tool_name -> original progress line
         self._tool_timer_tick_count: int = 0  # for spinner rotation
+        self._timer_lock = threading.Lock()  # guards _tool_start_times & _tool_timer_labels
 
 
     def _stream_is_message(self) -> bool:
@@ -509,11 +510,12 @@ class GatewayStreamConsumer:
             # A new tool starting means any previous tools are done.
             # Clear stale entries so the timer only shows current tools.
             # Keep _thinking if present (it's cleared by text delta).
-            stale = [k for k in self._tool_start_times if k != tool_name and k != "_thinking"]
-            for k in stale:
-                del self._tool_start_times[k]
-                self._tool_timer_labels.pop(k, None)
-            self._tool_timer_labels[tool_name] = line
+            with self._timer_lock:
+                stale = [k for k in self._tool_start_times if k != tool_name and k != "_thinking"]
+                for k in stale:
+                    del self._tool_start_times[k]
+                    self._tool_timer_labels.pop(k, None)
+                self._tool_timer_labels[tool_name] = line
             self._start_tool_timer(tool_name)
 
     def _compose_frame_content(self) -> str:
@@ -560,15 +562,19 @@ class GatewayStreamConsumer:
             self._tool_timer_handle = self._tool_timer_loop.call_later(
                 1.0, self._tool_timer_tick,
             )
+            logger.info("[timer] armed")
 
     def _stop_tool_timer(self) -> None:
         """Cancel the tool-timer animation and clear associated state."""
+        was_running = self._tool_timer_handle is not None
         if self._tool_timer_handle is not None:
             self._tool_timer_handle.cancel()
             self._tool_timer_handle = None
-        self._tool_start_times.clear()
-        self._tool_timer_labels.clear()
+        with self._timer_lock:
+            self._tool_start_times.clear()
+            self._tool_timer_labels.clear()
         self._tool_timer_tick_count = 0
+        logger.info("[timer] stopped (was_running=%s)", was_running)
 
     def on_llm_thinking(self, label: "str | None" = None) -> None:
         """Signal that an LLM API call has started — show thinking animation.
@@ -584,15 +590,16 @@ class GatewayStreamConsumer:
         if not self._native_stream_opened:
             return
         # LLM thinking means all tools are done — clear tool entries
-        stale = [k for k in self._tool_start_times if k != "_thinking"]
-        for k in stale:
-            del self._tool_start_times[k]
-            self._tool_timer_labels.pop(k, None)
-        if "_thinking" not in self._tool_start_times:
-            self._tool_start_times["_thinking"] = time.monotonic()
-        # Store the label for display in _tool_timer_tick
-        if label:
-            self._tool_timer_labels["_thinking"] = label
+        with self._timer_lock:
+            stale = [k for k in self._tool_start_times if k != "_thinking"]
+            for k in stale:
+                del self._tool_start_times[k]
+                self._tool_timer_labels.pop(k, None)
+            if "_thinking" not in self._tool_start_times:
+                self._tool_start_times["_thinking"] = time.monotonic()
+            # Store the label for display in _tool_timer_tick
+            if label:
+                self._tool_timer_labels["_thinking"] = label
         # Arm the timer if not already running
         if self._tool_timer_handle is None and self._tool_timer_loop is not None:
             self._tool_timer_loop.call_soon_threadsafe(self._arm_tool_timer)
@@ -602,30 +609,32 @@ class GatewayStreamConsumer:
 
         Runs on the asyncio event loop thread (via ``call_later``).
         """
-        if not self._tool_start_times:
-            # All tools cleared — don't re-arm
-            self._tool_timer_handle = None
-            return
+        with self._timer_lock:
+            if not self._tool_start_times:
+                # All tools cleared — don't re-arm
+                self._tool_timer_handle = None
+                return
 
-        self._tool_timer_tick_count += 1
-        now = time.monotonic()
-        lines: list[str] = []
-        for tool_name, start in self._tool_start_times.items():
-            elapsed = int(now - start)
-            spinner = _SPINNER_CHARS[self._tool_timer_tick_count % len(_SPINNER_CHARS)]
-            if tool_name == "_thinking":
-                thinking_label = self._tool_timer_labels.get("_thinking")
-                if thinking_label:
-                    lines.append(f"{spinner} 💭 {thinking_label} ({elapsed}s)")
+            self._tool_timer_tick_count += 1
+            logger.info("[timer] tick #%d, entries=%d", self._tool_timer_tick_count, len(self._tool_start_times))
+            now = time.monotonic()
+            lines: list[str] = []
+            for tool_name, start in self._tool_start_times.items():
+                elapsed = int(now - start)
+                spinner = _SPINNER_CHARS[self._tool_timer_tick_count % len(_SPINNER_CHARS)]
+                if tool_name == "_thinking":
+                    thinking_label = self._tool_timer_labels.get("_thinking")
+                    if thinking_label:
+                        lines.append(f"{spinner} 💭 {thinking_label} ({elapsed}s)")
+                    else:
+                        lines.append(f"{spinner} 💭 Thinking ({elapsed}s)")
                 else:
-                    lines.append(f"{spinner} 💭 Thinking ({elapsed}s)")
-            else:
-                # Use the original progress line (full summary) as label,
-                # stripping any trailing "..." and appending elapsed time.
-                label = self._tool_timer_labels.get(tool_name, f"{tool_name}...")
-                lines.append(f"{spinner} {label} ({elapsed}s)")
+                    # Use the original progress line (full summary) as label,
+                    # stripping any trailing "..." and appending elapsed time.
+                    label = self._tool_timer_labels.get(tool_name, f"{tool_name}...")
+                    lines.append(f"{spinner} {label} ({elapsed}s)")
 
-        self._tool_progress_lines = lines
+            self._tool_progress_lines = lines
         self._tool_progress_active = True
         # Wake the drain loop so it pushes a frame
         self._queue.put(_TIMER_TICK)
@@ -1548,6 +1557,7 @@ class GatewayStreamConsumer:
                             # No-op wake-up from the tool-timer tick — the tick
                             # already updated _tool_progress_lines and set
                             # _tool_progress_active. Just drain it.
+                            logger.info("[timer] drain-loop received TIMER_TICK, tool_progress_active=%s", self._tool_progress_active)
                             continue
                         self._filter_and_accumulate(item)
                     except queue.Empty:
@@ -3287,6 +3297,8 @@ class GatewayStreamConsumer:
             # connection mode has no polling cadence, so every cumulative
             # update is pushed as soon as it arrives.
             if not finalize and text == self._last_sent_text:
+                if self._tool_progress_active:
+                    logger.info("[timer] frame suppressed by dedup (len=%d)", len(text))
                 return True  # unchanged — skip
 
             # B2 — timeout-inversion race fix. For a finalize frame, mark
