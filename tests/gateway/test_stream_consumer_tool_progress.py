@@ -311,3 +311,305 @@ class TestToolProgressDrainLoop:
             assert "Searching" not in final_text
             assert "terminal" not in final_text
             assert "---" not in final_text
+
+
+# === TOOL-TIMER ANIMATION TESTS ===
+
+import time
+
+from gateway.stream_consumer import (
+    _TIMER_TICK,
+    _SPINNER_CHARS,
+    _parse_tool_name,
+)
+
+
+class TestParseToolName:
+    """Tests for the _parse_tool_name helper."""
+
+    def test_running_terminal(self):
+        assert _parse_tool_name("🔧 Running terminal...") == "terminal"
+
+    def test_calling_web_search(self):
+        assert _parse_tool_name("⚙️ Calling web_search...") == "web_search"
+
+    def test_using_read_file(self):
+        assert _parse_tool_name("📄 Using read_file...") == "read_file"
+
+    def test_bare_tool_name(self):
+        assert _parse_tool_name("🔍 Searching...") == "Searching"
+
+    def test_no_emoji(self):
+        assert _parse_tool_name("Running terminal...") == "terminal"
+
+    def test_fallback_on_empty(self):
+        assert _parse_tool_name("!!!") == "tool"
+
+
+class TestToolTimerStart:
+    """Tests for timer start behavior."""
+
+    def test_timer_starts_on_first_tool_progress(self):
+        """Timer handle should be armed after on_tool_progress on native streaming."""
+        consumer = _make_consumer(native_streaming=True)
+        # Simulate the event loop being captured (normally done in run())
+        loop = asyncio.new_event_loop()
+        consumer._tool_timer_loop = loop
+        try:
+            consumer.on_tool_progress("🔧 Running terminal...")
+            # Timer handle should have been armed
+            assert consumer._tool_timer_handle is not None
+            assert "terminal" in consumer._tool_start_times
+        finally:
+            consumer._tool_timer_handle.cancel()
+            loop.close()
+
+    def test_timer_does_not_start_on_non_native(self):
+        """Timer should NOT arm when native streaming is off."""
+        consumer = _make_consumer(native_streaming=False)
+        loop = asyncio.new_event_loop()
+        consumer._tool_timer_loop = loop
+        try:
+            consumer.on_tool_progress("🔧 Running terminal...")
+            assert consumer._tool_timer_handle is None
+            assert consumer._tool_start_times == {}
+        finally:
+            loop.close()
+
+    def test_multiple_tools_get_independent_start_times(self):
+        """Each tool should have its own start time."""
+        consumer = _make_consumer(native_streaming=True)
+        loop = asyncio.new_event_loop()
+        consumer._tool_timer_loop = loop
+        try:
+            consumer.on_tool_progress("🔧 Running terminal...")
+            consumer.on_tool_progress("⚙️ Calling web_search...")
+            assert "terminal" in consumer._tool_start_times
+            assert "web_search" in consumer._tool_start_times
+            assert len(consumer._tool_start_times) == 2
+        finally:
+            consumer._tool_timer_handle.cancel()
+            loop.close()
+
+
+class TestToolTimerTick:
+    """Tests for the tick callback behavior."""
+
+    def test_tick_updates_progress_lines(self):
+        """A manual tick should rebuild _tool_progress_lines with spinner + elapsed."""
+        consumer = _make_consumer(native_streaming=True)
+        loop = asyncio.new_event_loop()
+        consumer._tool_timer_loop = loop
+        try:
+            # Manually set state as if on_tool_progress had been called
+            consumer._tool_start_times = {"terminal": time.monotonic() - 5}
+            consumer._tool_timer_tick_count = 0
+
+            # Invoke tick directly
+            consumer._tool_timer_tick()
+
+            assert len(consumer._tool_progress_lines) == 1
+            line = consumer._tool_progress_lines[0]
+            # Should contain spinner char, tool name, and elapsed time
+            assert "terminal" in line
+            assert "s)" in line
+            # Spinner should be the second char (tick_count becomes 1)
+            assert line[0] == _SPINNER_CHARS[1]
+            # Should have put _TIMER_TICK in queue
+            item = consumer._queue.get_nowait()
+            assert item is _TIMER_TICK
+            # Should have set _tool_progress_active
+            assert consumer._tool_progress_active is True
+            # Timer should be re-armed
+            assert consumer._tool_timer_handle is not None
+        finally:
+            if consumer._tool_timer_handle:
+                consumer._tool_timer_handle.cancel()
+            loop.close()
+
+    def test_tick_multiple_tools(self):
+        """Tick with multiple tools produces one line per tool."""
+        consumer = _make_consumer(native_streaming=True)
+        loop = asyncio.new_event_loop()
+        consumer._tool_timer_loop = loop
+        try:
+            now = time.monotonic()
+            consumer._tool_start_times = {
+                "terminal": now - 10,
+                "web_search": now - 3,
+            }
+            consumer._tool_timer_tick_count = 0
+
+            consumer._tool_timer_tick()
+
+            assert len(consumer._tool_progress_lines) == 2
+            names_in_lines = " ".join(consumer._tool_progress_lines)
+            assert "terminal" in names_in_lines
+            assert "web_search" in names_in_lines
+        finally:
+            if consumer._tool_timer_handle:
+                consumer._tool_timer_handle.cancel()
+            loop.close()
+
+    def test_tick_no_rearm_when_tools_cleared(self):
+        """Tick with no active tools should not re-arm the timer."""
+        consumer = _make_consumer(native_streaming=True)
+        loop = asyncio.new_event_loop()
+        consumer._tool_timer_loop = loop
+        try:
+            consumer._tool_start_times = {}  # no tools
+            consumer._tool_timer_tick()
+            assert consumer._tool_timer_handle is None
+        finally:
+            loop.close()
+
+
+class TestToolTimerStop:
+    """Tests for timer stop conditions."""
+
+    def test_timer_stops_on_text_delta(self):
+        """_append_accumulated should stop the timer."""
+        consumer = _make_consumer(native_streaming=True)
+        loop = asyncio.new_event_loop()
+        consumer._tool_timer_loop = loop
+        try:
+            consumer._tool_start_times = {"terminal": time.monotonic()}
+            consumer._tool_timer_handle = loop.call_later(100, lambda: None)
+
+            consumer._append_accumulated("Hello")
+
+            assert consumer._tool_timer_handle is None
+            assert consumer._tool_start_times == {}
+        finally:
+            loop.close()
+
+    def test_timer_stops_on_finalize(self):
+        """_stop_tool_timer called on got_done path."""
+        consumer = _make_consumer(native_streaming=True)
+        loop = asyncio.new_event_loop()
+        consumer._tool_timer_loop = loop
+        try:
+            consumer._tool_start_times = {"terminal": time.monotonic()}
+            consumer._tool_timer_handle = loop.call_later(100, lambda: None)
+
+            consumer._stop_tool_timer()
+
+            assert consumer._tool_timer_handle is None
+            assert consumer._tool_start_times == {}
+            assert consumer._tool_timer_tick_count == 0
+        finally:
+            loop.close()
+
+    def test_timer_stops_on_segment_reset(self):
+        """_reset_segment_state should stop the timer."""
+        consumer = _make_consumer(native_streaming=True)
+        loop = asyncio.new_event_loop()
+        consumer._tool_timer_loop = loop
+        try:
+            consumer._tool_start_times = {"terminal": time.monotonic()}
+            consumer._tool_timer_handle = loop.call_later(100, lambda: None)
+
+            consumer._reset_segment_state()
+
+            assert consumer._tool_timer_handle is None
+            assert consumer._tool_start_times == {}
+        finally:
+            loop.close()
+
+
+class TestToolTimerDrainLoop:
+    """Integration tests for timer ticks in the drain loop."""
+
+    @pytest.mark.asyncio
+    async def test_timer_tick_wakes_drain_loop(self):
+        """_TIMER_TICK sentinel should be drained without error."""
+        consumer = _make_consumer(native_streaming=True)
+        # Simulate: tool_progress + manual tick + finish
+        consumer.on_tool_progress("🔧 Running terminal...")
+        # Put a timer tick into the queue (simulating what _tool_timer_tick does)
+        consumer._queue.put(_TIMER_TICK)
+        consumer.finish()
+
+        task = asyncio.create_task(consumer.run())
+        await asyncio.sleep(0.5)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        # Should not crash — the drain loop handles _TIMER_TICK gracefully
+        frames = consumer.adapter.frames
+        assert len(frames) >= 1  # At least a seed frame
+
+    @pytest.mark.asyncio
+    async def test_timer_produces_animated_frames(self):
+        """With real timer ticking, frames should update with elapsed time."""
+        consumer = _make_consumer(native_streaming=True)
+
+        # Start the run loop
+        task = asyncio.create_task(consumer.run())
+        await asyncio.sleep(0.1)  # Let run() start and set _tool_timer_loop
+
+        # Inject tool progress (this arms the timer via on_tool_progress)
+        consumer.on_tool_progress("🔧 Running terminal...")
+        # Wait >2 seconds for at least 2 ticks
+        await asyncio.sleep(2.5)
+
+        # Finish up
+        consumer.finish()
+        await asyncio.sleep(0.3)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        frames = consumer.adapter.frames
+        # Filter non-finalize frames that contain terminal timer output
+        timer_frames = [
+            f for f in frames
+            if not f["finalize"] and f["text"] and "terminal" in f["text"] and "s)" in f["text"]
+        ]
+        # We should have at least 2 frames showing different elapsed times
+        assert len(timer_frames) >= 2, (
+            f"Expected >=2 timer frames, got {len(timer_frames)}: "
+            f"{[f['text'] for f in timer_frames]}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_timer_stops_when_text_arrives(self):
+        """Timer frames should stop once a text delta arrives."""
+        consumer = _make_consumer(native_streaming=True)
+
+        task = asyncio.create_task(consumer.run())
+        await asyncio.sleep(0.1)
+
+        consumer.on_tool_progress("🔧 Running terminal...")
+        await asyncio.sleep(1.5)  # Let timer tick once
+
+        # Text delta arrives → timer should stop
+        consumer.on_delta("Result: done")
+        await asyncio.sleep(0.3)
+
+        # Timer should be stopped
+        assert consumer._tool_start_times == {}
+        assert consumer._tool_timer_handle is None
+
+        consumer.finish()
+        await asyncio.sleep(0.3)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        # The finalize frame should be pure text (no spinner)
+        frames = consumer.adapter.frames
+        finalize_frames = [f for f in frames if f["finalize"]]
+        if finalize_frames:
+            assert "Result: done" in finalize_frames[-1]["text"]
+            assert "s)" not in finalize_frames[-1]["text"]
+
+
+import time
