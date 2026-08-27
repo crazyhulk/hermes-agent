@@ -357,11 +357,14 @@ class TestToolTimerStart:
         consumer._tool_timer_loop = loop
         try:
             consumer.on_tool_progress("🔧 Running terminal...")
+            # call_soon_threadsafe schedules _arm_tool_timer; run it now
+            loop.run_until_complete(asyncio.sleep(0))
             # Timer handle should have been armed
             assert consumer._tool_timer_handle is not None
             assert "terminal" in consumer._tool_start_times
         finally:
-            consumer._tool_timer_handle.cancel()
+            if consumer._tool_timer_handle:
+                consumer._tool_timer_handle.cancel()
             loop.close()
 
     def test_timer_does_not_start_on_non_native(self):
@@ -376,19 +379,27 @@ class TestToolTimerStart:
         finally:
             loop.close()
 
-    def test_multiple_tools_get_independent_start_times(self):
-        """Each tool should have its own start time."""
+    def test_sequential_tools_clear_stale_entries(self):
+        """Sequential on_tool_progress calls should clear previous tool entries.
+
+        When tool B starts after tool A, tool A is done — its entry should be
+        removed from _tool_start_times so the timer only shows tool B.
+        """
         consumer = _make_consumer(native_streaming=True)
         loop = asyncio.new_event_loop()
         consumer._tool_timer_loop = loop
         try:
             consumer.on_tool_progress("🔧 Running terminal...")
             consumer.on_tool_progress("⚙️ Calling web_search...")
-            assert "terminal" in consumer._tool_start_times
+            # Flush scheduled _arm_tool_timer callback
+            loop.run_until_complete(asyncio.sleep(0))
+            # Only the latest tool should remain
+            assert "terminal" not in consumer._tool_start_times
             assert "web_search" in consumer._tool_start_times
-            assert len(consumer._tool_start_times) == 2
+            assert len(consumer._tool_start_times) == 1
         finally:
-            consumer._tool_timer_handle.cancel()
+            if consumer._tool_timer_handle:
+                consumer._tool_timer_handle.cancel()
             loop.close()
 
 
@@ -613,3 +624,465 @@ class TestToolTimerDrainLoop:
 
 
 import time
+
+
+# === THREAD-SAFE TIMER ARM TESTS ===
+
+
+class TestThreadSafeTimerArm:
+    """Verify _start_tool_timer uses call_soon_threadsafe, not call_later."""
+
+    def test_start_tool_timer_uses_call_soon_threadsafe(self):
+        """_start_tool_timer must use call_soon_threadsafe for thread safety."""
+        consumer = _make_consumer(native_streaming=True)
+        loop = MagicMock()
+        loop.call_soon_threadsafe = MagicMock()
+        loop.call_later = MagicMock()
+        consumer._tool_timer_loop = loop
+        consumer._tool_timer_handle = None
+
+        consumer._start_tool_timer("terminal")
+
+        # call_soon_threadsafe should be called (not call_later directly)
+        loop.call_soon_threadsafe.assert_called_once_with(consumer._arm_tool_timer)
+        loop.call_later.assert_not_called()
+
+    def test_arm_tool_timer_calls_call_later(self):
+        """_arm_tool_timer (on event loop) should use call_later."""
+        consumer = _make_consumer(native_streaming=True)
+        loop = asyncio.new_event_loop()
+        consumer._tool_timer_loop = loop
+        consumer._tool_timer_handle = None
+        try:
+            consumer._arm_tool_timer()
+            assert consumer._tool_timer_handle is not None
+        finally:
+            consumer._tool_timer_handle.cancel()
+            loop.close()
+
+    def test_arm_tool_timer_idempotent(self):
+        """_arm_tool_timer should not re-arm if already armed."""
+        consumer = _make_consumer(native_streaming=True)
+        loop = asyncio.new_event_loop()
+        consumer._tool_timer_loop = loop
+        try:
+            # First arm
+            consumer._arm_tool_timer()
+            first_handle = consumer._tool_timer_handle
+            # Second arm — should be a no-op
+            consumer._arm_tool_timer()
+            assert consumer._tool_timer_handle is first_handle
+        finally:
+            if consumer._tool_timer_handle:
+                consumer._tool_timer_handle.cancel()
+            loop.close()
+
+    def test_on_tool_progress_uses_threadsafe(self):
+        """on_tool_progress → _start_tool_timer → call_soon_threadsafe."""
+        consumer = _make_consumer(native_streaming=True)
+        loop = MagicMock()
+        loop.call_soon_threadsafe = MagicMock()
+        loop.call_later = MagicMock()
+        consumer._tool_timer_loop = loop
+        consumer._tool_timer_handle = None
+
+        consumer.on_tool_progress("🔧 Running terminal...")
+
+        loop.call_soon_threadsafe.assert_called_once()
+        loop.call_later.assert_not_called()
+
+
+# === THINKING ANIMATION TESTS ===
+
+
+class TestOnLlmThinking:
+    """Tests for on_llm_thinking() behavior."""
+
+    def test_thinking_starts_timer(self):
+        """on_llm_thinking should add _thinking entry and arm timer."""
+        consumer = _make_consumer(native_streaming=True)
+        loop = MagicMock()
+        loop.call_soon_threadsafe = MagicMock()
+        consumer._tool_timer_loop = loop
+        consumer._tool_timer_handle = None
+        consumer._native_stream_opened = True
+
+        consumer.on_llm_thinking()
+
+        assert "_thinking" in consumer._tool_start_times
+        loop.call_soon_threadsafe.assert_called_once_with(consumer._arm_tool_timer)
+
+    def test_thinking_noop_when_stream_not_opened(self):
+        """on_llm_thinking should be a no-op if native stream not opened."""
+        consumer = _make_consumer(native_streaming=True)
+        loop = MagicMock()
+        loop.call_soon_threadsafe = MagicMock()
+        consumer._tool_timer_loop = loop
+        consumer._tool_timer_handle = None
+        consumer._native_stream_opened = False
+
+        consumer.on_llm_thinking()
+
+        assert "_thinking" not in consumer._tool_start_times
+        loop.call_soon_threadsafe.assert_not_called()
+
+    def test_thinking_noop_when_not_native_streaming(self):
+        """on_llm_thinking should be a no-op if native streaming disabled."""
+        consumer = _make_consumer(native_streaming=False)
+        loop = MagicMock()
+        loop.call_soon_threadsafe = MagicMock()
+        consumer._tool_timer_loop = loop
+        consumer._tool_timer_handle = None
+        consumer._native_stream_opened = True
+
+        consumer.on_llm_thinking()
+
+        assert "_thinking" not in consumer._tool_start_times
+        loop.call_soon_threadsafe.assert_not_called()
+
+    def test_thinking_uses_call_soon_threadsafe(self):
+        """on_llm_thinking must use call_soon_threadsafe (thread-safe)."""
+        consumer = _make_consumer(native_streaming=True)
+        loop = MagicMock()
+        loop.call_soon_threadsafe = MagicMock()
+        loop.call_later = MagicMock()
+        consumer._tool_timer_loop = loop
+        consumer._tool_timer_handle = None
+        consumer._native_stream_opened = True
+
+        consumer.on_llm_thinking()
+
+        loop.call_soon_threadsafe.assert_called_once_with(consumer._arm_tool_timer)
+        loop.call_later.assert_not_called()
+
+    def test_thinking_cleared_by_text_delta(self):
+        """_append_accumulated should clear _thinking via _stop_tool_timer."""
+        consumer = _make_consumer(native_streaming=True)
+        loop = asyncio.new_event_loop()
+        consumer._tool_timer_loop = loop
+        try:
+            consumer._tool_start_times = {"_thinking": time.monotonic()}
+            consumer._tool_timer_handle = loop.call_later(100, lambda: None)
+
+            consumer._append_accumulated("Hello")
+
+            assert "_thinking" not in consumer._tool_start_times
+            assert consumer._tool_timer_handle is None
+        finally:
+            loop.close()
+
+
+class TestThinkingTimerTick:
+    """Tests for _tool_timer_tick display of _thinking entry."""
+
+    def test_thinking_displays_with_thinking_label(self):
+        """Tick should display '💭 Thinking (Xs)' for _thinking entry."""
+        consumer = _make_consumer(native_streaming=True)
+        loop = asyncio.new_event_loop()
+        consumer._tool_timer_loop = loop
+        try:
+            consumer._tool_start_times = {"_thinking": time.monotonic() - 3}
+            consumer._tool_timer_tick_count = 0
+
+            consumer._tool_timer_tick()
+
+            assert len(consumer._tool_progress_lines) == 1
+            line = consumer._tool_progress_lines[0]
+            assert "Thinking" in line
+            assert "s)" in line
+            # Should NOT contain "_thinking" literally
+            assert "_thinking" not in line
+        finally:
+            if consumer._tool_timer_handle:
+                consumer._tool_timer_handle.cancel()
+            loop.close()
+
+    def test_thinking_and_tool_coexist(self):
+        """Tick with both _thinking and a real tool shows both."""
+        consumer = _make_consumer(native_streaming=True)
+        loop = asyncio.new_event_loop()
+        consumer._tool_timer_loop = loop
+        try:
+            now = time.monotonic()
+            consumer._tool_start_times = {
+                "_thinking": now - 5,
+                "terminal": now - 10,
+            }
+            consumer._tool_timer_tick_count = 0
+
+            consumer._tool_timer_tick()
+
+            assert len(consumer._tool_progress_lines) == 2
+            all_text = " ".join(consumer._tool_progress_lines)
+            assert "Thinking" in all_text
+            assert "terminal" in all_text
+        finally:
+            if consumer._tool_timer_handle:
+                consumer._tool_timer_handle.cancel()
+            loop.close()
+
+
+# === MULTI-TURN CYCLE TESTS ===
+
+
+class TestMultiTurnToolThinkingCycle:
+    """Integration test: tool → thinking → text → tool cycle."""
+
+    @pytest.mark.asyncio
+    async def test_tool_then_thinking_then_text_then_tool(self):
+        """Simulate a multi-turn cycle: tool → LLM thinking → text → tool."""
+        consumer = _make_consumer(native_streaming=True)
+
+        # Start the run loop
+        task = asyncio.create_task(consumer.run())
+        await asyncio.sleep(0.1)
+
+        # Phase 1: Tool running
+        consumer.on_tool_progress("🔧 Running terminal...")
+        await asyncio.sleep(1.5)  # Let timer tick
+
+        assert "terminal" in consumer._tool_start_times
+        assert consumer._tool_timer_handle is not None
+
+        # Phase 2: Text arrives (tool done), timer stops
+        consumer.on_delta("Result: done. ")
+        await asyncio.sleep(0.2)
+        assert consumer._tool_start_times == {}
+        assert consumer._tool_timer_handle is None
+
+        # Phase 3: LLM thinking starts (next API call)
+        consumer._native_stream_opened = True  # ensure stream is open
+        consumer.on_llm_thinking()
+        await asyncio.sleep(1.5)
+
+        assert "_thinking" in consumer._tool_start_times
+
+        # Phase 4: Text arrives again (thinking done)
+        consumer.on_delta("Now doing more work.")
+        await asyncio.sleep(0.2)
+        assert "_thinking" not in consumer._tool_start_times
+        assert consumer._tool_timer_handle is None
+
+        # Phase 5: Another tool starts
+        consumer.on_tool_progress("⚙️ Calling web_search...")
+        await asyncio.sleep(1.5)
+        assert "web_search" in consumer._tool_start_times
+
+        # Finish
+        consumer.finish()
+        await asyncio.sleep(0.3)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        # Verify: accumulated text has both parts
+        assert "Result: done." in consumer._accumulated
+        assert "Now doing more work." in consumer._accumulated
+
+    @pytest.mark.asyncio
+    async def test_thinking_timer_produces_frames(self):
+        """The thinking timer should produce animated frames."""
+        consumer = _make_consumer(native_streaming=True)
+
+        # Start the run loop
+        task = asyncio.create_task(consumer.run())
+        await asyncio.sleep(0.1)
+
+        # Open the stream manually (normally done by first frame send)
+        consumer._native_stream_opened = True
+
+        # Start thinking
+        consumer.on_llm_thinking()
+        await asyncio.sleep(2.5)  # Let timer tick at least twice
+
+        # Check that frames were produced with "Thinking"
+        frames = consumer.adapter.frames
+        thinking_frames = [
+            f for f in frames
+            if not f["finalize"] and f["text"] and "Thinking" in f["text"]
+        ]
+        assert len(thinking_frames) >= 2, (
+            f"Expected >=2 thinking frames, got {len(thinking_frames)}: "
+            f"{[f['text'] for f in thinking_frames]}"
+        )
+
+        # Stop via text delta
+        consumer.on_delta("Answer")
+        consumer.finish()
+        await asyncio.sleep(0.3)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+# === STALE ENTRY CLEANUP TESTS ===
+
+
+class TestStaleEntryCleanup:
+    """Tests for the stale tool-timer entry cleanup fix.
+
+    Validates that sequential tool calls don't pile up entries in
+    _tool_start_times, preventing the frozen-timer-lines bug.
+    """
+
+    def test_sequential_tools_only_latest_in_start_times(self):
+        """Sequential tools: only the latest tool should be tracked."""
+        consumer = _make_consumer(native_streaming=True)
+        loop = asyncio.new_event_loop()
+        consumer._tool_timer_loop = loop
+        try:
+            consumer.on_tool_progress("🔧 Running ls -lt...")
+            consumer.on_tool_progress("🔧 Running grep...")
+            consumer.on_tool_progress("🔧 Running sed...")
+            loop.run_until_complete(asyncio.sleep(0))
+
+            # Only the last tool should remain
+            assert len(consumer._tool_start_times) == 1
+            assert "sed" in consumer._tool_start_times
+            assert "ls" not in consumer._tool_start_times
+            assert "grep" not in consumer._tool_start_times
+            # Labels should also be cleaned
+            assert "sed" in consumer._tool_timer_labels
+            assert len(consumer._tool_timer_labels) == 1
+        finally:
+            if consumer._tool_timer_handle:
+                consumer._tool_timer_handle.cancel()
+            loop.close()
+
+    def test_thinking_preserved_when_tool_arrives(self):
+        """_thinking entry should NOT be cleared when a new tool arrives."""
+        consumer = _make_consumer(native_streaming=True)
+        loop = asyncio.new_event_loop()
+        consumer._tool_timer_loop = loop
+        consumer._native_stream_opened = True
+        try:
+            # Simulate: thinking started, then tool starts
+            consumer.on_llm_thinking()
+            consumer.on_tool_progress("🔧 Running terminal...")
+            loop.run_until_complete(asyncio.sleep(0))
+
+            # Both _thinking and terminal should be present
+            assert "_thinking" in consumer._tool_start_times
+            assert "terminal" in consumer._tool_start_times
+            assert len(consumer._tool_start_times) == 2
+        finally:
+            if consumer._tool_timer_handle:
+                consumer._tool_timer_handle.cancel()
+            loop.close()
+
+    def test_on_llm_thinking_clears_tool_entries(self):
+        """on_llm_thinking should clear all tool entries (tools are done)."""
+        consumer = _make_consumer(native_streaming=True)
+        loop = asyncio.new_event_loop()
+        consumer._tool_timer_loop = loop
+        consumer._native_stream_opened = True
+        try:
+            # Simulate: two tools were tracked, then LLM starts thinking
+            consumer._tool_start_times = {
+                "terminal": time.monotonic() - 60,
+                "grep": time.monotonic() - 40,
+            }
+            consumer._tool_timer_labels = {
+                "terminal": "🔧 Running terminal...",
+                "grep": "🔧 Running grep...",
+            }
+
+            consumer.on_llm_thinking()
+            loop.run_until_complete(asyncio.sleep(0))
+
+            # Tool entries should be gone, only _thinking remains
+            assert "terminal" not in consumer._tool_start_times
+            assert "grep" not in consumer._tool_start_times
+            assert "_thinking" in consumer._tool_start_times
+            assert len(consumer._tool_start_times) == 1
+            # Labels should be cleaned too
+            assert "terminal" not in consumer._tool_timer_labels
+            assert "grep" not in consumer._tool_timer_labels
+        finally:
+            if consumer._tool_timer_handle:
+                consumer._tool_timer_handle.cancel()
+            loop.close()
+
+    def test_on_llm_thinking_preserves_existing_thinking(self):
+        """on_llm_thinking should not reset _thinking if already present."""
+        consumer = _make_consumer(native_streaming=True)
+        loop = asyncio.new_event_loop()
+        consumer._tool_timer_loop = loop
+        consumer._native_stream_opened = True
+        try:
+            original_time = time.monotonic() - 5
+            consumer._tool_start_times = {"_thinking": original_time}
+
+            consumer.on_llm_thinking()
+
+            # Should keep the original start time
+            assert consumer._tool_start_times["_thinking"] == original_time
+        finally:
+            if consumer._tool_timer_handle:
+                consumer._tool_timer_handle.cancel()
+            loop.close()
+
+    def test_same_tool_called_again_keeps_original_time(self):
+        """Re-calling on_tool_progress with the same tool keeps its start time."""
+        consumer = _make_consumer(native_streaming=True)
+        loop = asyncio.new_event_loop()
+        consumer._tool_timer_loop = loop
+        try:
+            consumer.on_tool_progress("🔧 Running terminal...")
+            loop.run_until_complete(asyncio.sleep(0))
+            original_time = consumer._tool_start_times["terminal"]
+
+            # Same tool name again — should not reset the start time
+            consumer.on_tool_progress("🔧 Running terminal...")
+            assert consumer._tool_start_times["terminal"] == original_time
+        finally:
+            if consumer._tool_timer_handle:
+                consumer._tool_timer_handle.cancel()
+            loop.close()
+
+    @pytest.mark.asyncio
+    async def test_sequential_tools_no_frozen_lines(self):
+        """End-to-end: sequential tools should not produce stale timer lines.
+
+        Simulates the reported bug: tool A → tool B → tool C without text
+        between them. Only the latest tool should show in timer frames.
+        """
+        consumer = _make_consumer(native_streaming=True)
+
+        task = asyncio.create_task(consumer.run())
+        await asyncio.sleep(0.1)
+
+        # Simulate sequential tools without text between them
+        consumer.on_tool_progress("🔧 Running ls -lt...")
+        await asyncio.sleep(1.2)  # Let timer tick
+
+        consumer.on_tool_progress("🔧 Running grep...")
+        await asyncio.sleep(1.2)  # Let timer tick
+
+        consumer.on_tool_progress("🔧 Running sed...")
+        await asyncio.sleep(1.2)  # Let timer tick
+
+        # At this point, only "sed" should be in _tool_start_times
+        assert len(consumer._tool_start_times) == 1
+        assert "sed" in consumer._tool_start_times
+
+        # Check that the latest frames only show "sed", not old tools
+        frames = consumer.adapter.frames
+        # Get the last few non-finalize frames
+        recent_frames = [f for f in frames[-5:] if not f["finalize"] and f["text"]]
+        if recent_frames:
+            last_frame = recent_frames[-1]["text"]
+            assert "ls" not in last_frame
+            assert "grep" not in last_frame
+
+        consumer.finish()
+        await asyncio.sleep(0.3)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass

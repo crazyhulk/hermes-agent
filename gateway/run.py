@@ -4391,6 +4391,15 @@ class TurnRunner:
                 ctx.progress_queue.put(msg)
             return
 
+        # LLM thinking animation: when a subsequent LLM API call starts
+        # (after tools have already run), show a "Thinking" timer in the
+        # native-stream bubble so the user knows the agent is still working.
+        if event_type == "llm.request_started":
+            _sc = ctx.stream_consumer_holder[0] if ctx.stream_consumer_holder else None
+            if _sc is not None and getattr(_sc, "accepts_tool_progress", False):
+                _sc.on_llm_thinking()
+            return
+
         # Native task cards consume the authoritative ID-bearing
         # tool_start/tool_complete callbacks instead. Do not also enqueue
         # name-correlated text events, which would duplicate cards and

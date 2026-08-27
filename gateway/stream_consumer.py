@@ -457,6 +457,7 @@ class GatewayStreamConsumer:
         self._tool_timer_handle: Optional[asyncio.TimerHandle] = None
         self._tool_timer_loop: Optional[asyncio.AbstractEventLoop] = None
         self._tool_start_times: dict[str, float] = {}  # tool_name -> monotonic start
+        self._tool_timer_labels: dict[str, str] = {}  # tool_name -> original progress line
         self._tool_timer_tick_count: int = 0  # for spinner rotation
 
 
@@ -502,8 +503,17 @@ class GatewayStreamConsumer:
         """
         if line:
             self._queue.put((_TOOL_PROGRESS, line))
-            # Start/join the timer for this tool
+            # Start/join the timer for this tool, preserving the original
+            # progress line as the display label for animated ticks.
             tool_name = _parse_tool_name(line)
+            # A new tool starting means any previous tools are done.
+            # Clear stale entries so the timer only shows current tools.
+            # Keep _thinking if present (it's cleared by text delta).
+            stale = [k for k in self._tool_start_times if k != tool_name and k != "_thinking"]
+            for k in stale:
+                del self._tool_start_times[k]
+                self._tool_timer_labels.pop(k, None)
+            self._tool_timer_labels[tool_name] = line
             self._start_tool_timer(tool_name)
 
     def _compose_frame_content(self) -> str:
@@ -531,16 +541,22 @@ class GatewayStreamConsumer:
         already running.  Only arms when ``_use_native_streaming`` is True
         (non-native platforms don't benefit from sub-second bubble updates).
 
-        Thread-safe: called from the agent worker thread.  The tick callback
-        runs on the asyncio event loop thread — the same thread as the drain
-        loop — so mutations to ``_tool_progress_lines`` are safe.
+        Thread-safe: called from the agent worker thread.  Uses
+        call_soon_threadsafe to schedule the first tick on the event loop.
         """
         if not self._use_native_streaming:
             return
         if tool_name not in self._tool_start_times:
             self._tool_start_times[tool_name] = time.monotonic()
-        # Arm the periodic tick if not already running
+        # Arm the periodic tick if not already running.
+        # Use call_soon_threadsafe because this method is called from the
+        # agent worker thread, not the event loop thread.
         if self._tool_timer_handle is None and self._tool_timer_loop is not None:
+            self._tool_timer_loop.call_soon_threadsafe(self._arm_tool_timer)
+
+    def _arm_tool_timer(self) -> None:
+        """Arm the 1s periodic tick.  Must run on the event loop thread."""
+        if self._tool_timer_handle is None:
             self._tool_timer_handle = self._tool_timer_loop.call_later(
                 1.0, self._tool_timer_tick,
             )
@@ -551,7 +567,29 @@ class GatewayStreamConsumer:
             self._tool_timer_handle.cancel()
             self._tool_timer_handle = None
         self._tool_start_times.clear()
+        self._tool_timer_labels.clear()
         self._tool_timer_tick_count = 0
+
+    def on_llm_thinking(self) -> None:
+        """Signal that an LLM API call has started — show thinking animation.
+
+        Thread-safe: called from the agent worker thread.  Only activates
+        when the native stream is already open (the bubble is visible).
+        """
+        if not self._use_native_streaming:
+            return
+        if not self._native_stream_opened:
+            return
+        # LLM thinking means all tools are done — clear tool entries
+        stale = [k for k in self._tool_start_times if k != "_thinking"]
+        for k in stale:
+            del self._tool_start_times[k]
+            self._tool_timer_labels.pop(k, None)
+        if "_thinking" not in self._tool_start_times:
+            self._tool_start_times["_thinking"] = time.monotonic()
+        # Arm the timer if not already running
+        if self._tool_timer_handle is None and self._tool_timer_loop is not None:
+            self._tool_timer_loop.call_soon_threadsafe(self._arm_tool_timer)
 
     def _tool_timer_tick(self) -> None:
         """Periodic tick: rebuild tool-progress lines with spinner + elapsed.
@@ -569,7 +607,13 @@ class GatewayStreamConsumer:
         for tool_name, start in self._tool_start_times.items():
             elapsed = int(now - start)
             spinner = _SPINNER_CHARS[self._tool_timer_tick_count % len(_SPINNER_CHARS)]
-            lines.append(f"{spinner} {tool_name} ({elapsed}s)")
+            if tool_name == "_thinking":
+                lines.append(f"{spinner} Thinking ({elapsed}s)")
+            else:
+                # Use the original progress line (full summary) as label,
+                # stripping any trailing "..." and appending elapsed time.
+                label = self._tool_timer_labels.get(tool_name, f"{tool_name}...")
+                lines.append(f"{spinner} {label} ({elapsed}s)")
 
         self._tool_progress_lines = lines
         self._tool_progress_active = True

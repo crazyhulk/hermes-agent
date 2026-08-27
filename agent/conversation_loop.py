@@ -3219,6 +3219,17 @@ def run_conversation(
                 elif _model_request_active is not None:
                     _model_request_active.set()
                 _redirect_crossed_response = False
+                # Fire "thinking" signal so the stream consumer shows
+                # animation during TTFB.  Only on subsequent API calls
+                # (api_call_count > 1) — the first call is covered by
+                # the seed frame + platform typing indicator.
+                if api_call_count > 1 and agent.tool_progress_callback:
+                    try:
+                        agent.tool_progress_callback(
+                            "llm.request_started", "_thinking_timer", None, None,
+                        )
+                    except Exception:
+                        pass
                 try:
                     response = run_llm_execution_middleware(
                         api_kwargs,
