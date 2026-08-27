@@ -391,7 +391,7 @@ _TOOL_STREAMING_BETA = "fine-grained-tool-streaming-2025-05-14"
 # subscriptions reject it, but Bedrock/Azure still need it for 1M context.
 # Self-hosted / corporate Anthropic-Messages gateways (e.g. company LLM
 # proxies that front Claude with their own auth scheme) typically gate 1M
-# behind this same header — opt them in via ``HERMES_ANTHROPIC_CONTEXT_1M=1``.
+# behind this same header — opt them in via ``model.context_1m_beta: true``.
 _CONTEXT_1M_BETA = "context-1m-2025-08-07"
 
 # Fast mode beta — enables the ``speed: "fast"`` request parameter for
@@ -672,32 +672,46 @@ def _requires_bearer_auth(base_url: str | None) -> bool:
     )
 
 
-def _force_context_1m_beta_via_env() -> bool:
-    """Return True when ``HERMES_ANTHROPIC_CONTEXT_1M`` opts the request in.
+def _force_context_1m_beta() -> bool:
+    """Return True when ``model.context_1m_beta`` is enabled in config.yaml.
 
     Self-hosted / corporate Anthropic-Messages gateways (e.g. internal
     LLM proxies that front Claude with a custom auth scheme) typically
     expose 1M context behind the same ``anthropic-beta:
     context-1m-2025-08-07`` header that Anthropic's own API uses, but
     Hermes only auto-attaches the beta on hosts the adapter recognises
-    (Azure Foundry, Bedrock). This env switch lets users opt those
-    gateways in without per-host wiring. Truthy values: ``1``, ``true``,
-    ``yes``, ``on`` (case-insensitive).
+    (Azure Foundry, Bedrock).
+
+    Config::
+
+        # ~/.hermes/config.yaml
+        model:
+          context_1m_beta: true
     """
-    raw = os.environ.get("HERMES_ANTHROPIC_CONTEXT_1M", "").strip().lower()
-    return raw in ("1", "true", "yes", "on")
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+        val = model_cfg.get("context_1m_beta", False)
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, str):
+            return val.strip().lower() in ("1", "true", "yes", "on")
+        return bool(val)
+    except Exception:
+        return False
 
 
 def _base_url_needs_context_1m_beta(base_url: str | None) -> bool:
     """Return True for endpoints that still gate 1M context behind a beta.
 
-    Honours the ``HERMES_ANTHROPIC_CONTEXT_1M`` env switch so that
+    Honours the ``model.context_1m_beta`` config option so that
     self-hosted / corporate Anthropic-Messages gateways can opt their
     requests in without per-host wiring. The drop_context_1m_beta path
     in ``_common_betas_for_base_url`` still wins, so reactive recovery
     after a 400 keeps working.
     """
-    if _force_context_1m_beta_via_env():
+    if _force_context_1m_beta():
         return True
     normalized = _normalize_base_url_text(base_url).lower()
     if not normalized:
