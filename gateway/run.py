@@ -4397,7 +4397,7 @@ class TurnRunner:
         if event_type == "llm.request_started":
             _sc = ctx.stream_consumer_holder[0] if ctx.stream_consumer_holder else None
             if _sc is not None and getattr(_sc, "accepts_tool_progress", False):
-                _sc.on_llm_thinking()
+                _sc.on_llm_thinking(preview or None)
             return
 
         # Native task cards consume the authoritative ID-bearing

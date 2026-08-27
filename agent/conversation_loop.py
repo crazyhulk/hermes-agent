@@ -3225,8 +3225,9 @@ def run_conversation(
                 # the seed frame + platform typing indicator.
                 if api_call_count > 1 and agent.tool_progress_callback:
                     try:
+                        _thinking_preview = f"{agent.model or 'LLM'} (API call #{api_call_count})"
                         agent.tool_progress_callback(
-                            "llm.request_started", "_thinking_timer", None, None,
+                            "llm.request_started", "_thinking_timer", _thinking_preview, None,
                         )
                     except Exception:
                         pass

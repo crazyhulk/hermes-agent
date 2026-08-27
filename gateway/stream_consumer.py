@@ -570,11 +570,14 @@ class GatewayStreamConsumer:
         self._tool_timer_labels.clear()
         self._tool_timer_tick_count = 0
 
-    def on_llm_thinking(self) -> None:
+    def on_llm_thinking(self, label: "str | None" = None) -> None:
         """Signal that an LLM API call has started — show thinking animation.
 
         Thread-safe: called from the agent worker thread.  Only activates
         when the native stream is already open (the bubble is visible).
+
+        ``label`` is an optional display string (e.g. "claude-4.6-opus (API call #3)")
+        shown alongside the thinking timer for richer context.
         """
         if not self._use_native_streaming:
             return
@@ -587,6 +590,9 @@ class GatewayStreamConsumer:
             self._tool_timer_labels.pop(k, None)
         if "_thinking" not in self._tool_start_times:
             self._tool_start_times["_thinking"] = time.monotonic()
+        # Store the label for display in _tool_timer_tick
+        if label:
+            self._tool_timer_labels["_thinking"] = label
         # Arm the timer if not already running
         if self._tool_timer_handle is None and self._tool_timer_loop is not None:
             self._tool_timer_loop.call_soon_threadsafe(self._arm_tool_timer)
@@ -608,7 +614,11 @@ class GatewayStreamConsumer:
             elapsed = int(now - start)
             spinner = _SPINNER_CHARS[self._tool_timer_tick_count % len(_SPINNER_CHARS)]
             if tool_name == "_thinking":
-                lines.append(f"{spinner} Thinking ({elapsed}s)")
+                thinking_label = self._tool_timer_labels.get("_thinking")
+                if thinking_label:
+                    lines.append(f"{spinner} 💭 {thinking_label} ({elapsed}s)")
+                else:
+                    lines.append(f"{spinner} 💭 Thinking ({elapsed}s)")
             else:
                 # Use the original progress line (full summary) as label,
                 # stripping any trailing "..." and appending elapsed time.
