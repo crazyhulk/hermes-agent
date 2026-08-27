@@ -1484,7 +1484,7 @@ class GatewayStreamConsumer:
                                 or self._message_id
                                 or self._last_sent_text
                             )
-                            if _streamed_something and not self._turn_split_delivery:
+                            if _streamed_something and not self._turn_split_delivery and not self._use_native_streaming:
                                 _final_payload = self._clean_for_display(item[1])
                                 _visible = self._clean_for_display(self._accumulated)
                                 if _final_payload and _final_payload != _visible:
