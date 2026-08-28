@@ -485,10 +485,13 @@ class GatewayStreamConsumer:
     def accepts_tool_progress(self) -> bool:
         """Whether this consumer can absorb tool progress into its stream.
 
-        True only when native streaming is resolved and active. Callers use
-        this to decide the progress routing path (in-stream vs progress_queue).
+        True only when native streaming is resolved and active AND the
+        adapter supports the tool timer feature. Callers use this to decide
+        the progress routing path (in-stream vs progress_queue).
         """
-        return self._use_native_streaming
+        if not self._use_native_streaming:
+            return False
+        return bool(getattr(self.adapter, "SUPPORTS_TOOL_TIMER", True))
 
     def on_tool_progress(self, line: str) -> None:
         """Inject a tool-progress status line into the native stream bubble.
