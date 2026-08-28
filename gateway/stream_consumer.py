@@ -508,14 +508,10 @@ class GatewayStreamConsumer:
             # Start/join the timer for this tool, preserving the original
             # progress line as the display label for animated ticks.
             tool_name = _parse_tool_name(line)
-            # A new tool starting means any previous tools are done.
-            # Clear stale entries so the timer only shows current tools.
-            # Keep _thinking if present (it's cleared by text delta).
+            # Don't clear other running tools — they may be parallel.
+            # on_tool_completed() handles moving finished tools to
+            # _tool_completed_lines when tool.completed fires.
             with self._timer_lock:
-                stale = [k for k in self._tool_start_times if k != tool_name and k != "_thinking"]
-                for k in stale:
-                    del self._tool_start_times[k]
-                    self._tool_timer_labels.pop(k, None)
                 self._tool_timer_labels[tool_name] = line
             self._start_tool_timer(tool_name)
 
@@ -526,13 +522,20 @@ class GatewayStreamConsumer:
         append tool lines below the text separated by a horizontal rule.
         On finalize, only accumulated text is sent (no tool lines).
         """
-        if self._accumulated and self._tool_progress_lines:
+        # Build the tool overlay: active progress lines (which include
+        # completed history when the timer is ticking) or just completed
+        # history when the timer has stopped but history remains.
+        tool_lines = self._tool_progress_lines
+        if not tool_lines and self._tool_completed_lines:
+            tool_lines = list(self._tool_completed_lines)
+
+        if self._accumulated and tool_lines:
             # Text + active tool status at the bottom
-            return self._accumulated + "\n\n---\n" + "\n".join(self._tool_progress_lines)
+            return self._accumulated + "\n\n---\n" + "\n".join(tool_lines)
         elif self._accumulated:
             return self._accumulated
-        elif self._tool_progress_lines:
-            return "\n".join(self._tool_progress_lines)
+        elif tool_lines:
+            return "\n".join(tool_lines)
         return ""
 
     # ── Tool-timer animation ─────────────────────────────────────────
@@ -588,9 +591,9 @@ class GatewayStreamConsumer:
             self._tool_start_times.pop(tool_name, None)
             completion_line = f"✓ {label} ({int(duration)}s)"
             self._tool_completed_lines.append(completion_line)
-            # Keep max 3 entries
-            if len(self._tool_completed_lines) > 3:
-                self._tool_completed_lines = self._tool_completed_lines[-3:]
+            # Keep max 5 entries
+            if len(self._tool_completed_lines) > 5:
+                self._tool_completed_lines = self._tool_completed_lines[-5:]
         self._tool_progress_active = True
         self._queue.put(_TIMER_TICK)
 
@@ -607,12 +610,20 @@ class GatewayStreamConsumer:
             return
         if not self._native_stream_opened:
             return
-        # LLM thinking means all tools are done — clear tool entries
+        # LLM thinking means all tools are done — move remaining tool entries
+        # to completed history, then start the thinking timer.
         with self._timer_lock:
             stale = [k for k in self._tool_start_times if k != "_thinking"]
+            now = time.monotonic()
             for k in stale:
-                del self._tool_start_times[k]
-                self._tool_timer_labels.pop(k, None)
+                start = self._tool_start_times.pop(k)
+                tool_label = self._tool_timer_labels.pop(k, k)
+                elapsed = int(now - start)
+                completion_line = f"✓ {tool_label} ({elapsed}s)"
+                self._tool_completed_lines.append(completion_line)
+            # Trim to max 5 completed entries
+            if len(self._tool_completed_lines) > 5:
+                self._tool_completed_lines = self._tool_completed_lines[-5:]
             if "_thinking" not in self._tool_start_times:
                 self._tool_start_times["_thinking"] = time.monotonic()
             # Store the label for display in _tool_timer_tick
@@ -762,8 +773,8 @@ class GatewayStreamConsumer:
         if self._tool_progress_lines:
             self._tool_progress_lines.clear()
             self._tool_progress_active = False
-        if self._tool_completed_lines:
-            self._tool_completed_lines.clear()
+        # Keep _tool_completed_lines — they persist below the text until
+        # finalize so the user sees tool history throughout the turn.
         # Stop the tool-timer animation — text means tools are done.
         if self._tool_start_times:
             self._stop_tool_timer()

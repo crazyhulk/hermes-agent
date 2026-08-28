@@ -379,11 +379,12 @@ class TestToolTimerStart:
         finally:
             loop.close()
 
-    def test_sequential_tools_clear_stale_entries(self):
-        """Sequential on_tool_progress calls should clear previous tool entries.
+    def test_sequential_tools_keep_parallel_entries(self):
+        """Sequential on_tool_progress calls should keep all tool entries.
 
-        When tool B starts after tool A, tool A is done — its entry should be
-        removed from _tool_start_times so the timer only shows tool B.
+        When tool B starts after tool A, both may be running in parallel —
+        their entries should coexist in _tool_start_times so the timer shows
+        both. on_tool_completed handles cleanup when tools actually finish.
         """
         consumer = _make_consumer(native_streaming=True)
         loop = asyncio.new_event_loop()
@@ -393,10 +394,10 @@ class TestToolTimerStart:
             consumer.on_tool_progress("⚙️ Calling web_search...")
             # Flush scheduled _arm_tool_timer callback
             loop.run_until_complete(asyncio.sleep(0))
-            # Only the latest tool should remain
-            assert "terminal" not in consumer._tool_start_times
+            # Both tools should be present (parallel support)
+            assert "terminal" in consumer._tool_start_times
             assert "web_search" in consumer._tool_start_times
-            assert len(consumer._tool_start_times) == 1
+            assert len(consumer._tool_start_times) == 2
         finally:
             if consumer._tool_timer_handle:
                 consumer._tool_timer_handle.cancel()
@@ -929,8 +930,8 @@ class TestStaleEntryCleanup:
     _tool_start_times, preventing the frozen-timer-lines bug.
     """
 
-    def test_sequential_tools_only_latest_in_start_times(self):
-        """Sequential tools: only the latest tool should be tracked."""
+    def test_sequential_tools_all_tracked_in_start_times(self):
+        """Sequential tools: all tools should be tracked (parallel support)."""
         consumer = _make_consumer(native_streaming=True)
         loop = asyncio.new_event_loop()
         consumer._tool_timer_loop = loop
@@ -940,14 +941,16 @@ class TestStaleEntryCleanup:
             consumer.on_tool_progress("🔧 Running sed...")
             loop.run_until_complete(asyncio.sleep(0))
 
-            # Only the last tool should remain
-            assert len(consumer._tool_start_times) == 1
+            # All tools should be present (parallel support)
+            assert len(consumer._tool_start_times) == 3
+            assert "ls" in consumer._tool_start_times
+            assert "grep" in consumer._tool_start_times
             assert "sed" in consumer._tool_start_times
-            assert "ls" not in consumer._tool_start_times
-            assert "grep" not in consumer._tool_start_times
-            # Labels should also be cleaned
+            # Labels should all be present
+            assert "ls" in consumer._tool_timer_labels
+            assert "grep" in consumer._tool_timer_labels
             assert "sed" in consumer._tool_timer_labels
-            assert len(consumer._tool_timer_labels) == 1
+            assert len(consumer._tool_timer_labels) == 3
         finally:
             if consumer._tool_timer_handle:
                 consumer._tool_timer_handle.cancel()
@@ -1045,11 +1048,12 @@ class TestStaleEntryCleanup:
             loop.close()
 
     @pytest.mark.asyncio
-    async def test_sequential_tools_no_frozen_lines(self):
-        """End-to-end: sequential tools should not produce stale timer lines.
+    async def test_sequential_tools_show_all_parallel(self):
+        """End-to-end: sequential tool.started events without tool.completed
+        should show all tools in the timer (parallel support).
 
-        Simulates the reported bug: tool A → tool B → tool C without text
-        between them. Only the latest tool should show in timer frames.
+        When tool A, B, C all start without completion events in between,
+        all three show in the timer bubble simultaneously.
         """
         consumer = _make_consumer(native_streaming=True)
 
@@ -1066,18 +1070,20 @@ class TestStaleEntryCleanup:
         consumer.on_tool_progress("🔧 Running sed...")
         await asyncio.sleep(1.2)  # Let timer tick
 
-        # At this point, only "sed" should be in _tool_start_times
-        assert len(consumer._tool_start_times) == 1
+        # All three tools should be in _tool_start_times (parallel)
+        assert len(consumer._tool_start_times) == 3
+        assert "ls" in consumer._tool_start_times
+        assert "grep" in consumer._tool_start_times
         assert "sed" in consumer._tool_start_times
 
-        # Check that the latest frames only show "sed", not old tools
+        # Check that the latest frames show ALL tools
         frames = consumer.adapter.frames
-        # Get the last few non-finalize frames
         recent_frames = [f for f in frames[-5:] if not f["finalize"] and f["text"]]
         if recent_frames:
             last_frame = recent_frames[-1]["text"]
-            assert "ls" not in last_frame
-            assert "grep" not in last_frame
+            assert "ls" in last_frame
+            assert "grep" in last_frame
+            assert "sed" in last_frame
 
         consumer.finish()
         await asyncio.sleep(0.3)
