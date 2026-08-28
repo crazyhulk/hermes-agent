@@ -460,6 +460,7 @@ class GatewayStreamConsumer:
         self._tool_timer_labels: dict[str, str] = {}  # tool_name -> original progress line
         self._tool_timer_tick_count: int = 0  # for spinner rotation
         self._timer_lock = threading.Lock()  # guards _tool_start_times & _tool_timer_labels
+        self._tool_completed_lines: list[str] = []  # completed tool history (max 3)
 
 
     def _stream_is_message(self) -> bool:
@@ -573,8 +574,25 @@ class GatewayStreamConsumer:
         with self._timer_lock:
             self._tool_start_times.clear()
             self._tool_timer_labels.clear()
+            self._tool_completed_lines.clear()
         self._tool_timer_tick_count = 0
         logger.info("[timer] stopped (was_running=%s)", was_running)
+
+    def on_tool_completed(self, tool_name: str, duration: float) -> None:
+        """Record a completed tool in the history overlay.
+
+        Thread-safe: called from the agent worker thread.
+        """
+        with self._timer_lock:
+            label = self._tool_timer_labels.pop(tool_name, tool_name)
+            self._tool_start_times.pop(tool_name, None)
+            completion_line = f"✓ {label} ({int(duration)}s)"
+            self._tool_completed_lines.append(completion_line)
+            # Keep max 3 entries
+            if len(self._tool_completed_lines) > 3:
+                self._tool_completed_lines = self._tool_completed_lines[-3:]
+        self._tool_progress_active = True
+        self._queue.put(_TIMER_TICK)
 
     def on_llm_thinking(self, label: "str | None" = None) -> None:
         """Signal that an LLM API call has started — show thinking animation.
@@ -618,7 +636,7 @@ class GatewayStreamConsumer:
             self._tool_timer_tick_count += 1
             logger.info("[timer] tick #%d, entries=%d", self._tool_timer_tick_count, len(self._tool_start_times))
             now = time.monotonic()
-            lines: list[str] = []
+            lines: list[str] = list(self._tool_completed_lines)  # completed history first
             for tool_name, start in self._tool_start_times.items():
                 elapsed = int(now - start)
                 spinner = _SPINNER_CHARS[self._tool_timer_tick_count % len(_SPINNER_CHARS)]
@@ -744,6 +762,8 @@ class GatewayStreamConsumer:
         if self._tool_progress_lines:
             self._tool_progress_lines.clear()
             self._tool_progress_active = False
+        if self._tool_completed_lines:
+            self._tool_completed_lines.clear()
         # Stop the tool-timer animation — text means tools are done.
         if self._tool_start_times:
             self._stop_tool_timer()
@@ -1023,6 +1043,7 @@ class GatewayStreamConsumer:
         # starts clean.
         self._tool_progress_lines = []
         self._tool_progress_active = False
+        self._tool_completed_lines = []
         # Stop the tool-timer animation on segment reset.
         self._stop_tool_timer()
         # #29346: a tool/segment boundary means what we delivered was an interim

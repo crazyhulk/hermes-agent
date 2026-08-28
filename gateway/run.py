@@ -4415,7 +4415,15 @@ class TurnRunner:
         if not ctx.tool_progress_enabled:
             return
 
-        # Only act on tool.started events (ignore tool.completed, reasoning.available, etc.)
+        # Handle tool.completed for native stream timer history
+        if event_type == "tool.completed":
+            _sc = ctx.stream_consumer_holder[0] if ctx.stream_consumer_holder else None
+            if _sc is not None and getattr(_sc, "accepts_tool_progress", False):
+                _duration = kwargs.get("duration", 0.0)
+                _sc.on_tool_completed(tool_name or "unknown", _duration)
+            return
+
+        # Only act on tool.started events (ignore reasoning.available, etc.)
         if event_type not in {"tool.started",}:
             return
 
