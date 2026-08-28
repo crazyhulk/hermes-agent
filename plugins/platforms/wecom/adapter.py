@@ -3235,11 +3235,6 @@ class WeComAdapter(BasePlatformAdapter):
                 # mark — the root cause of the "Cla"/"ude" split-bubble bug.
                 turn.accumulated_text = text
 
-                if turn._intermediate_frames_sent >= MAX_INTERMEDIATE_FRAMES:
-                    # Frame cap reached — drop intermediates, keep accumulating.
-                    # The finalize path will drain whatever is left.
-                    return True
-
                 # Pure dedup: skip if content is identical to last sent frame.
                 if text == turn.last_sent_content:
                     return True

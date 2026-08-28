@@ -1059,39 +1059,29 @@ class TestSendStreamFrame:
         assert turn.accumulated_text == "alpha beta"
 
     @pytest.mark.asyncio
-    async def test_intermediate_frame_cap_drops_excess(self):
-        """After MAX_INTERMEDIATE_FRAMES, further intermediate frames are dropped."""
-        from plugins.platforms.wecom.adapter import WeComAdapter, MAX_INTERMEDIATE_FRAMES
+    async def test_no_intermediate_frame_cap(self):
+        """Intermediate frames are never dropped — no frame cap in fire-and-forget mode."""
+        from plugins.platforms.wecom.adapter import WeComAdapter
 
         adapter = WeComAdapter(PlatformConfig(enabled=True))
         adapter._last_chat_req_ids["chat-1"] = "req-1"
         adapter._ws = MagicMock(closed=False)
-        # Auto-ack so seed + first frame go through
         self._mock_send_json_with_immediate_ack(adapter)
 
-        # First call creates turn + seed + content frame.
         turn_id = "cap-test"
         await adapter.send_stream_frame("first", chat_id="chat-1", turn_id=turn_id)
         turn_key = f"chat-1:{turn_id}"
         turn = adapter._stream_turns[turn_key]
 
-        # Artificially set counter to the cap.
-        turn._intermediate_frames_sent = MAX_INTERMEDIATE_FRAMES
-        turn._last_frame_sent_at = 0  # clear time throttle
+        # Even with a high frame count, new frames still go through.
+        turn._intermediate_frames_sent = 200
+        turn._last_frame_sent_at = 0
 
-        # Record count BEFORE the overflow frame to assert it was truly skipped.
-        before_overflow = len(adapter._sent_frames)
-
-        # Next intermediate frame should be dropped.
-        ok = await adapter.send_stream_frame("overflow", chat_id="chat-1", turn_id=turn_id)
+        before = len(adapter._sent_frames)
+        ok = await adapter.send_stream_frame("still-sends", chat_id="chat-1", turn_id=turn_id)
         assert ok is True
-        assert turn.accumulated_text == "overflow"
-        # No additional frame sent — overflow was dropped.
-        assert len(adapter._sent_frames) == before_overflow
-
-        # Finalize still goes through unconditionally.
-        ok = await adapter.send_stream_frame("final", chat_id="chat-1", finalize=True, turn_id=turn_id)
-        assert ok is True
+        # Frame was sent (not dropped).
+        assert len(adapter._sent_frames) > before
 
     @pytest.mark.asyncio
     async def test_finalize_sends_finish_true_and_resets_state(self):
