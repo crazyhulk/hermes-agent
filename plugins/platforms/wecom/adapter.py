@@ -2413,10 +2413,11 @@ class WeComAdapter(BasePlatformAdapter):
         Uses the per-req_id reply queue with ack tracking, aligned with the
         official WeCom SDK's replyStreamNonBlocking semantics:
 
-          * **Intermediate frames** (finish=False): sent non-blocking via
-            ``_send_reply_queued(skip_if_pending=True)``. If a prior frame's
-            ack is still pending, the frame is skipped (cumulative text means
-            no information is lost — the next frame carries all content).
+          * **Intermediate frames** (finish=False): sent fire-and-forget via
+            direct ``_send_json`` — every frame is sent immediately regardless
+            of whether a prior ack is pending.  The ``pending_ack`` slot on the
+            ReplyQueue is still maintained (overwriting any stale entry) so that
+            the final frame can wait for the last intermediate ack to drain.
           * **Final frame** (finish=True): waits for any pending ack to drain
             before sending, then awaits its own ack. This prevents version
             conflicts (errcode 6000) between the finalize and a concurrent
@@ -2443,13 +2444,70 @@ class WeComAdapter(BasePlatformAdapter):
         }
 
         if not finish:
-            # Intermediate frame: non-blocking with pending-skip semantics.
-            # If a previous frame's ack is still pending on this req_id,
-            # skip this frame entirely (cumulative text guarantees no loss).
-            response = await self._send_reply_queued(
-                reply_req_id, body, is_final=False, skip_if_pending=True,
+            # Intermediate frame: truly fire-and-forget.
+            # We bypass _send_reply_queued's skip-if-pending gate and send
+            # every intermediate frame immediately via _send_json.  This
+            # prevents the streaming freeze where most timer frames were
+            # silently skipped because WeCom acks take longer than the 1s
+            # frame interval.
+            #
+            # We still register pending_ack on the ReplyQueue so that the
+            # finalize frame (is_final=True) can wait for the last
+            # intermediate frame's ack to drain — avoiding errcode 6000
+            # (version conflict).
+            if not self._ws or self._ws.closed:
+                raise RuntimeError("WeCom websocket is not connected")
+
+            normalized = str(reply_req_id or "").strip()
+            if not normalized:
+                raise ValueError("reply_req_id is required")
+
+            queue = self._reply_queues.get(normalized)
+            if queue is None:
+                queue = ReplyQueue(normalized)
+                self._reply_queues[normalized] = queue
+
+            # If a prior intermediate frame's ack is still pending, cancel
+            # its future (it's now stale — cumulative text means the new
+            # frame supersedes it) and overwrite with the new one.
+            if queue.pending_ack is not None:
+                old_frame = queue.pending_ack
+                if not old_frame.future.done():
+                    old_frame.future.cancel()
+
+            # Create future for THIS frame's ack
+            future: asyncio.Future = asyncio.get_running_loop().create_future()
+            frame = ReplyFrame(body=body, future=future, is_final=False)
+            frame.sent_at = time.monotonic()
+
+            # Register pending_ack BEFORE sending (so _resolve_reply_ack
+            # can route the ack if it arrives during the _send_json await).
+            self._reply_queues[normalized] = queue
+            queue.pending_ack = frame
+
+            logger.debug(
+                "[%s] _send_stream_reply: fire-and-forget intermediate — "
+                "req_id=%s stream_id=%s content_len=%d",
+                self.name, normalized,
+                body.get("stream", {}).get("id", "N/A"),
+                len(body.get("stream", {}).get("content", "") or ""),
             )
-            return response
+
+            try:
+                await self._send_json(
+                    {"cmd": APP_CMD_RESPONSE, "headers": {"req_id": normalized}, "body": body}
+                )
+            except Exception:
+                # Send failed — clear pending and cancel future
+                if queue.pending_ack is frame:
+                    queue.pending_ack = None
+                    if not self._reply_queues.get(normalized) or queue.pending_ack is None:
+                        self._reply_queues.pop(normalized, None)
+                if not future.done():
+                    future.cancel()
+                raise
+
+            return {"errcode": 0, "errmsg": "sent_fire_and_forget"}
 
         # Final frame: wait for any pending intermediate ack, then send
         # with ack tracking so we reliably detect 846608/6000.
