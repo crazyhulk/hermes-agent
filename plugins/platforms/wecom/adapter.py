@@ -1931,6 +1931,10 @@ class WeComAdapter(BasePlatformAdapter):
         turn_id: Optional[str],
     ) -> None:
         """Loop callback — dispatch an async keep-alive send without blocking."""
+        logger.info(
+            "[stream] keepalive FIRED for turn %s (finalized=%s, expired=%s)",
+            turn.stream_id, turn.finalized, turn.expired,
+        )
         turn.keepalive_handle = None
         if turn.finalized or turn.expired:
             return
@@ -2949,6 +2953,11 @@ class WeComAdapter(BasePlatformAdapter):
             if turn_id:
                 turn_key = f"{chat}:{turn_id}"
                 turn = self._stream_turns.get(turn_key)
+                if turn:
+                    logger.info(
+                        "[stream] reusing turn %s (turn_key=%s, finalized=%s, expired=%s)",
+                        turn.stream_id, turn_key, turn.finalized, turn.expired,
+                    )
                 if not turn:
                     # finalize=True should NOT create a new turn.
                     # If the turn was already cleaned up (e.g., due to errcode 6000),
@@ -2956,6 +2965,10 @@ class WeComAdapter(BasePlatformAdapter):
                     # creating a fresh turn just to finalize it (which would send
                     # another seed + finish, potentially triggering more conflicts).
                     if finalize:
+                        logger.info(
+                            "[stream] frame REJECTED (reason=%s, chat=%s, turn_id=%s)",
+                            "finalize_non_existent_turn", chat, turn_id,
+                        )
                         logger.debug(
                             "[%s] send_stream_frame: cannot finalize non-existent turn (turn_id=%s, chat=%s)",
                             self.name, turn_id, chat,
@@ -2965,6 +2978,10 @@ class WeComAdapter(BasePlatformAdapter):
                     # First frame for this turn: need to create it.
                     # Check if chat is expired (blocks NEW turn creation).
                     if chat in self._stream_expired_chats:
+                        logger.info(
+                            "[stream] frame REJECTED (reason=%s, chat=%s, turn_id=%s)",
+                            "chat_expired", chat, turn_id,
+                        )
                         logger.debug(
                             "[%s] send_stream_frame: chat %s is expired, cannot create new turn (turn_id=%s)",
                             self.name, chat, turn_id,
@@ -2974,6 +2991,10 @@ class WeComAdapter(BasePlatformAdapter):
                     # First frame for this turn: resolve req_id and create turn
                     req_id = self._resolve_stream_req_id(chat, reply_to)
                     if not req_id:
+                        logger.info(
+                            "[stream] frame REJECTED (reason=%s, chat=%s, turn_id=%s)",
+                            "no_req_id", chat, turn_id,
+                        )
                         logger.debug(
                             "[%s] send_stream_frame: no req_id available for chat %s (turn_id=%s)",
                             self.name, chat, turn_id,
@@ -2981,6 +3002,10 @@ class WeComAdapter(BasePlatformAdapter):
                         return False
                     turn = StreamTurn(chat, req_id)
                     self._stream_turns[turn_key] = turn
+                    logger.info(
+                        "[stream] created turn %s (turn_key=%s, req_id=%s, chat=%s)",
+                        turn.stream_id, turn_key, req_id, chat,
+                    )
                     logger.debug(
                         "[%s] send_stream_frame: created new turn %s (turn_id=%s, req_id=%s) for chat %s",
                         self.name, turn.stream_id, turn_id, req_id, chat,
@@ -3000,6 +3025,10 @@ class WeComAdapter(BasePlatformAdapter):
                     # No active turn, need to create a new one.
                     # Check if chat is expired at the chat level (blocks NEW turn creation).
                     if chat in self._stream_expired_chats:
+                        logger.info(
+                            "[stream] frame REJECTED (reason=%s, chat=%s, turn_id=%s)",
+                            "chat_expired", chat, turn_id,
+                        )
                         logger.debug(
                             "[%s] send_stream_frame: chat %s is expired, cannot create new turn",
                             self.name, chat,
@@ -3008,6 +3037,10 @@ class WeComAdapter(BasePlatformAdapter):
 
                     req_id = self._resolve_stream_req_id(chat, reply_to)
                     if not req_id:
+                        logger.info(
+                            "[stream] frame REJECTED (reason=%s, chat=%s, turn_id=%s)",
+                            "no_req_id", chat, turn_id,
+                        )
                         logger.debug(
                             "[%s] send_stream_frame: no req_id available for chat %s",
                             self.name, chat,
@@ -3021,6 +3054,10 @@ class WeComAdapter(BasePlatformAdapter):
 
             # Check if this turn has expired
             if turn.expired:
+                logger.info(
+                    "[stream] frame REJECTED (reason=%s, chat=%s, turn_id=%s)",
+                    "turn_expired", chat, turn_id,
+                )
                 return False
 
             # First frame for this turn: send seed ONLY if not already seeded.
@@ -3038,6 +3075,10 @@ class WeComAdapter(BasePlatformAdapter):
                     "<think></think>", finish=False,
                 )
                 turn.seeded = True
+                logger.info(
+                    "[stream] seed sent for turn %s (req_id=%s)",
+                    turn.stream_id, turn.req_id,
+                )
                 # Stream is now open on the server — arm the keep-alive timer
                 # (Layer 1) so long, content-sparse turns refresh the 6-min
                 # window.  No-op when keep-alive is disabled by config.
@@ -3085,6 +3126,10 @@ class WeComAdapter(BasePlatformAdapter):
                         turn.expired = True
                         self._retire_turn(turn, turn_id)
                         self._stream_expired_chats.add(chat)
+                        logger.info(
+                            "[stream] frame REJECTED (reason=%s, chat=%s, turn_id=%s)",
+                            "layer2_clock_fallback", chat, turn_id,
+                        )
                         return False
 
                 self._cancel_idle_flush(turn)
@@ -3110,8 +3155,16 @@ class WeComAdapter(BasePlatformAdapter):
                 if turn_id:
                     turn_key = f"{chat}:{turn_id}"
                     self._stream_turns.pop(turn_key, None)
+                    logger.info(
+                        "[stream] finalized turn %s (turn_key=%s)",
+                        turn.stream_id, turn_key,
+                    )
                 else:
                     self._cleanup_stream_turn(chat, turn.req_id)
+                    logger.info(
+                        "[stream] finalized turn %s (turn_key=%s)",
+                        turn.stream_id, f"{chat}:{turn.req_id}",
+                    )
             else:
                 # Fire-and-forget: gateway already decides when to push
                 # (pure identity-dedup in stream_consumer.py).  No adapter-
@@ -3140,6 +3193,10 @@ class WeComAdapter(BasePlatformAdapter):
                     turn.stream_id,
                     text,
                     finish=False,
+                )
+                logger.info(
+                    "[stream] frame pushed to turn %s (len=%d, finish=%s)",
+                    turn.stream_id, len(text), False,
                 )
                 turn._last_frame_sent_at = time.monotonic()
                 turn._intermediate_frames_sent += 1
@@ -3178,6 +3235,10 @@ class WeComAdapter(BasePlatformAdapter):
             # Mark the chat as stream-expired to prevent new stream attempts.
             # Other concurrent turns may continue if they're already active.
             self._stream_expired_chats.add(chat)
+            logger.info(
+                "[stream] frame REJECTED (reason=%s, chat=%s, turn_id=%s)",
+                "stream_expired_error", chat, turn_id,
+            )
             return False
         except Exception as exc:
             # Same intermediate/final split as the expired path above: a single
@@ -3201,6 +3262,10 @@ class WeComAdapter(BasePlatformAdapter):
             # Clean up this turn on error
             if 'turn' in locals():
                 self._retire_turn(turn, turn_id)
+            logger.info(
+                "[stream] frame REJECTED (reason=%s, chat=%s, turn_id=%s)",
+                "exception", chat, turn_id,
+            )
             return False
 
     def supports_native_streaming(
